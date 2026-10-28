@@ -19,8 +19,16 @@ jobs:
         run: xcodebuild -version
 
       # ── Set up Theos ────────────────────────────────────────────────────────
-      - name: Set up Theos
-        uses: theos/theos-action@main
+      - name: Install Theos
+        run: |
+          brew install ldid make dpkg
+          git clone --recursive https://github.com/theos/theos $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          # Link Xcode's iOS SDK into Theos's sdks directory
+          SDK=$(xcrun --show-sdk-path --sdk iphoneos)
+          VER=$(xcrun --show-sdk-version --sdk iphoneos)
+          mkdir -p $HOME/theos/sdks
+          ln -sf "$SDK" "$HOME/theos/sdks/iPhoneOS${VER}.sdk"
 
       # ── Build the Swift app (unsigned arm64) ────────────────────────────────
       - name: Build app
