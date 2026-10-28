@@ -1,0 +1,9 @@
+Package: com.local.airtagcat
+Name: AirTagCat
+Version: 1.0
+Architecture: iphoneos-arm64
+Description: Track your cat's AirTag — hooks locationd to get real AirTag proximity
+Maintainer: AirTagCat <noreply@local>
+Author: AirTagCat
+Section: Tweaks
+Depends: mobilesubstrate | libhooker | substitute

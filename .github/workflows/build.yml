@@ -1,4 +1,4 @@
-name: Build IPA
+name: Build DEB
 
 on:
   push:
@@ -18,7 +18,12 @@ jobs:
       - name: Xcode version
         run: xcodebuild -version
 
-      - name: Build (unsigned, arm64)
+      # ── Set up Theos ────────────────────────────────────────────────────────
+      - name: Set up Theos
+        uses: theos/theos-action@main
+
+      # ── Build the Swift app (unsigned arm64) ────────────────────────────────
+      - name: Build app
         working-directory: AirTagCat
         run: |
           xcodebuild \
@@ -33,30 +38,41 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             SYMROOT="$(pwd)/build"
 
-      - name: Embed entitlements (ad-hoc re-sign)
+      - name: Re-sign app with no-sandbox entitlement
         run: |
-          APP="AirTagCat/build/Release-iphoneos/AirTagCat.app"
-          # xcodebuild with iphoneos SDK refuses ad-hoc signing; codesign does not
           codesign -f -s "-" \
-            --entitlements "AirTagCat/AirTagCat/AirTagCat.entitlements" \
-            "$APP"
+            --entitlements AirTagCat/AirTagCat/AirTagCat.entitlements \
+            AirTagCat/build/Release-iphoneos/AirTagCat.app
 
-      - name: Package IPA
+      # ── Stage app into Theos layout so it ships inside the .deb ────────────
+      - name: Stage app in Theos layout
         run: |
-          APP="AirTagCat/build/Release-iphoneos/AirTagCat.app"
-          mkdir -p Payload
-          cp -R "$APP" Payload/
-          zip -qr AirTagCat.ipa Payload/
-          rm -rf Payload
-          echo "Built: $(du -sh AirTagCat.ipa | cut -f1)"
+          mkdir -p Tweak/layout/var/jb/Applications
+          cp -R AirTagCat/build/Release-iphoneos/AirTagCat.app \
+                Tweak/layout/var/jb/Applications/AirTagCat.app
 
+      # ── Build the Theos package (tweak dylib + app = combined .deb) ─────────
+      - name: Build Theos package
+        working-directory: Tweak
+        run: |
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+
+      - name: Locate .deb
+        id: deb
+        run: |
+          FILE=$(ls Tweak/packages/*.deb | head -1)
+          echo "path=$FILE" >> $GITHUB_OUTPUT
+          echo "name=$(basename $FILE)" >> $GITHUB_OUTPUT
+          echo "size=$(du -sh $FILE | cut -f1)" >> $GITHUB_OUTPUT
+
+      # ── Publish GitHub Release ───────────────────────────────────────────────
       - name: Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="v$(date +'%Y%m%d-%H%M%S')"
-          gh release create "$TAG" AirTagCat.ipa \
+          gh release create "$TAG" "${{ steps.deb.outputs.path }}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "AirTagCat $TAG" \
-            --notes $'Unsigned IPA — install via TrollStore or re-sign with Sideloadly.\n\n**Install via TrollStore:** AirDrop the IPA to your iPhone, open with TrollStore.\n**Install via Sideloadly:** Connect iPhone to Mac, open Sideloadly, drag IPA in.' \
+            --notes $'**Requires Dopamine jailbreak (iOS 15 – 16.6.1)**\n\n## Install\n1. AirDrop or SSH the `.deb` to your iPhone\n2. Open it with **Sileo** → install\n3. Respring when prompted — locationd restarts automatically\n4. Open **AirTagCat** from the home screen\n\nThe app reads AirTag data directly from `locationd`. No BLE scanning needed.' \
             --latest

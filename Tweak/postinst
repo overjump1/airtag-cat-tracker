@@ -1,0 +1,4 @@
+#!/bin/bash
+# Restart locationd to load the tweak, then register the app icon
+launchctl kickstart -k system/com.apple.locationd 2>/dev/null || true
+uicache --path /var/jb/Applications/AirTagCat.app 2>/dev/null || uicache --all 2>/dev/null || true

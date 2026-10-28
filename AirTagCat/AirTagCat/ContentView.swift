@@ -13,7 +13,7 @@ struct ContentView: View {
 
                 // ── Header ────────────────────────────────────────────────────
                 HStack(spacing: 6) {
-                    if service.state == .scanning {
+                    if service.state == .connecting {
                         ProgressView().scaleEffect(0.6).tint(.orange)
                     } else {
                         Circle()
