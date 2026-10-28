@@ -23,13 +23,13 @@ jobs:
         run: |
           xcodebuild \
             -project AirTagCat.xcodeproj \
-            -scheme AirTagCat \
+            -target AirTagCat \
             -sdk iphoneos \
             -configuration Release \
             -derivedDataPath ./DerivedData \
             ONLY_ACTIVE_ARCH=NO \
             ARCHS=arm64 \
-            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
