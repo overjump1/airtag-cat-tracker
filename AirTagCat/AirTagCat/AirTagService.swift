@@ -292,4 +292,3 @@ extension AirTagService: StreamDelegate {
         writeToChannel(ch, bytes: bytes)
     }
 }
-}
