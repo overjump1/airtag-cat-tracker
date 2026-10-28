@@ -78,11 +78,17 @@ struct ContentView: View {
 
                 // Daemon hint
                 if !service.daemonReady {
-                    Text("python3 controller.py --server")
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.orange.opacity(0.85))
-                        .padding(.top, 14)
-                        .multilineTextAlignment(.center)
+                    VStack(spacing: 4) {
+                        Text("Daemon not running")
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .foregroundColor(.orange)
+                        Text("Run install_on_device.sh once via SSH,\nthen respring or reboot.")
+                            .font(.system(size: 11, design: .rounded))
+                            .foregroundColor(.orange.opacity(0.7))
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(.top, 14)
+                    .padding(.horizontal, 24)
                 }
 
                 Spacer().frame(height: 44)
@@ -97,7 +103,7 @@ struct ContentView: View {
             Circle()
                 .fill(service.daemonReady ? Color.green : Color.red)
                 .frame(width: 7, height: 7)
-            Text(service.daemonReady ? "Daemon connected" : "Daemon offline")
+            Text(service.daemonReady ? "Daemon connected" : "Waiting for daemon…")
                 .font(.system(size: 12, weight: .medium, design: .monospaced))
                 .foregroundColor(service.daemonReady ? .green : .red)
             Spacer()
