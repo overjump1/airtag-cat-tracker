@@ -1,11 +1,8 @@
 import SwiftUI
 
 struct ContentView: View {
-
     @StateObject private var service = AirTagService()
-    @State private var soundOn = false
 
-    // ── Derived visuals ───────────────────────────────────────────────────────
     private var ringColor: Color {
         guard let d = service.distance else { return .gray }
         switch d {
@@ -17,18 +14,16 @@ struct ContentView: View {
         }
     }
 
-    // Maps distance → circle scale [0.15 … 0.85]
     private var ringScale: CGFloat {
-        guard let d = service.distance else { return 0.25 }
+        guard let d = service.distance else { return 0.18 }
         let clamped = min(max(d, 0.3), 30.0)
-        let t = log(clamped) / log(30.0)          // 0 (close) → 1 (far)
-        return CGFloat(0.85 - t * 0.70)
+        return CGFloat(0.85 - (log(clamped) / log(30.0)) * 0.70)
     }
 
     private var proximityLabel: String {
-        guard let d = service.distance else { return "No signal" }
+        guard let d = service.distance else { return "Searching…" }
         switch d {
-        case ..<1.0:  return "Right here 🐱"
+        case ..<1.0:  return "Right here \u{1F431}"
         case ..<3.0:  return "Very close"
         case ..<7.0:  return "Same room"
         case ..<15.0: return "Nearby"
@@ -36,24 +31,35 @@ struct ContentView: View {
         }
     }
 
-    // ── View ──────────────────────────────────────────────────────────────────
     var body: some View {
         ZStack {
             Color(red: 0.06, green: 0.06, blue: 0.10).ignoresSafeArea()
 
             VStack(spacing: 0) {
 
-                // Status chip
-                statusChip
-                    .padding(.top, 16)
-                    .padding(.horizontal, 20)
+                // ── Status chip ────────────────────────────────────────────────
+                HStack(spacing: 6) {
+                    if service.state.isScanning {
+                        ProgressView().scaleEffect(0.6).tint(.orange)
+                    } else {
+                        Circle()
+                            .fill(service.state.isReady ? Color.green : Color.red)
+                            .frame(width: 7, height: 7)
+                    }
+                    Text(service.state.label)
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundColor(service.state.isReady ? .green : .orange)
+                    Spacer()
+                }
+                .padding(.horizontal, 12).padding(.vertical, 7)
+                .background(Color.white.opacity(0.05)).cornerRadius(20)
+                .padding(.top, 16).padding(.horizontal, 20)
 
                 Spacer()
 
-                // Title
+                // ── Title ──────────────────────────────────────────────────────
                 VStack(spacing: 4) {
-                    Text("🐾")
-                        .font(.system(size: 44))
+                    Text("\u{1F43E}").font(.system(size: 44))
                     Text("Cat Tracker")
                         .font(.system(size: 30, weight: .bold, design: .rounded))
                         .foregroundColor(.white)
@@ -61,9 +67,44 @@ struct ContentView: View {
 
                 Spacer()
 
-                // Proximity ring
-                proximityRing
-                    .frame(width: 240, height: 240)
+                // ── Proximity ring ─────────────────────────────────────────────
+                ZStack {
+                    Circle().stroke(Color.white.opacity(0.06), lineWidth: 1.5)
+
+                    // Outer halo
+                    Circle()
+                        .stroke(ringColor.opacity(0.25), lineWidth: 2)
+                        .scaleEffect(ringScale * 1.18)
+
+                    // Filled dot
+                    Circle()
+                        .fill(RadialGradient(
+                            gradient: Gradient(colors: [ringColor, ringColor.opacity(0.35)]),
+                            center: .center, startRadius: 0, endRadius: 60
+                        ))
+                        .scaleEffect(ringScale)
+                        .shadow(color: ringColor.opacity(0.55), radius: 14)
+
+                    // RSSI + distance label
+                    VStack(spacing: 5) {
+                        if let r = service.rssi {
+                            Text("\(r) dBm")
+                                .font(.system(size: 24, weight: .bold, design: .monospaced))
+                                .foregroundColor(.white)
+                        } else {
+                            Text("---")
+                                .font(.system(size: 24, weight: .bold, design: .monospaced))
+                                .foregroundColor(.gray)
+                        }
+                        if let d = service.distance {
+                            Text(String(format: "\u{2248} %.1f m", d))
+                                .font(.system(size: 13, design: .monospaced))
+                                .foregroundColor(.white.opacity(0.65))
+                        }
+                    }
+                }
+                .frame(width: 240, height: 240)
+                .animation(.spring(response: 0.45, dampingFraction: 0.7), value: service.distance)
 
                 Text(proximityLabel)
                     .font(.system(size: 20, weight: .semibold, design: .rounded))
@@ -72,138 +113,49 @@ struct ContentView: View {
 
                 Spacer()
 
-                // Control buttons
-                soundButtons
-                    .padding(.horizontal, 24)
-
-                // Daemon hint
-                if !service.daemonReady {
-                    VStack(spacing: 4) {
-                        Text("Daemon not running")
-                            .font(.system(size: 12, weight: .semibold, design: .rounded))
-                            .foregroundColor(.orange)
-                        Text("Run install_on_device.sh once via SSH,\nthen respring or reboot.")
-                            .font(.system(size: 11, design: .rounded))
-                            .foregroundColor(.orange.opacity(0.7))
-                            .multilineTextAlignment(.center)
+                // ── Sound buttons ──────────────────────────────────────────────
+                HStack(spacing: 14) {
+                    Button {
+                        service.playSound()
+                    } label: {
+                        Label("Play Sound", systemImage: "bell.fill")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(service.soundOn ? .black : .white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 17)
+                            .background(service.soundOn ? Color.yellow : Color.white.opacity(0.14))
+                            .cornerRadius(15)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 15)
+                                    .stroke(Color.white.opacity(service.soundOn ? 0 : 0.2), lineWidth: 1)
+                            )
                     }
-                    .padding(.top, 14)
-                    .padding(.horizontal, 24)
+                    .disabled(!service.state.isReady)
+
+                    Button {
+                        service.stopSound()
+                    } label: {
+                        Label("Stop", systemImage: "bell.slash.fill")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 17)
+                            .background(Color.white.opacity(0.10))
+                            .cornerRadius(15)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 15)
+                                    .stroke(Color.white.opacity(0.2), lineWidth: 1)
+                            )
+                    }
+                    .disabled(!service.state.isReady)
                 }
+                .padding(.horizontal, 24)
 
                 Spacer().frame(height: 44)
             }
         }
-        .onAppear { service.startPolling() }
-    }
-
-    // ── Sub-views ─────────────────────────────────────────────────────────────
-    private var statusChip: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(service.daemonReady ? Color.green : Color.red)
-                .frame(width: 7, height: 7)
-            Text(service.daemonReady ? "Daemon connected" : "Waiting for daemon…")
-                .font(.system(size: 12, weight: .medium, design: .monospaced))
-                .foregroundColor(service.daemonReady ? .green : .red)
-            Spacer()
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
-        .background(Color.white.opacity(0.05))
-        .cornerRadius(20)
-    }
-
-    private var proximityRing: some View {
-        ZStack {
-            // Static outer guide ring
-            Circle()
-                .stroke(Color.white.opacity(0.06), lineWidth: 1.5)
-
-            // Animated proximity ring
-            Circle()
-                .stroke(ringColor.opacity(0.3), lineWidth: 2)
-                .scaleEffect(ringScale * 1.15)
-
-            // Filled dot that shrinks with distance
-            Circle()
-                .fill(
-                    RadialGradient(
-                        gradient: Gradient(colors: [ringColor, ringColor.opacity(0.4)]),
-                        center: .center,
-                        startRadius: 0,
-                        endRadius: 60
-                    )
-                )
-                .scaleEffect(ringScale)
-                .shadow(color: ringColor.opacity(0.6), radius: 12)
-
-            // RSSI + distance overlay
-            VStack(spacing: 5) {
-                if let r = service.rssi {
-                    Text("\(r) dBm")
-                        .font(.system(size: 24, weight: .bold, design: .monospaced))
-                        .foregroundColor(.white)
-                } else {
-                    Text("---")
-                        .font(.system(size: 24, weight: .bold, design: .monospaced))
-                        .foregroundColor(.gray)
-                }
-                if let d = service.distance {
-                    Text(String(format: "≈ %.1f m", d))
-                        .font(.system(size: 13, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.7))
-                }
-            }
-        }
-        .animation(.spring(response: 0.45, dampingFraction: 0.7), value: service.distance)
-    }
-
-    private var soundButtons: some View {
-        HStack(spacing: 14) {
-            Button {
-                Task {
-                    await service.playSound()
-                    soundOn = true
-                }
-            } label: {
-                Label("Play Sound", systemImage: "bell.fill")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundColor(soundOn ? .black : .white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 17)
-                    .background(soundOn ? Color.yellow : Color.white.opacity(0.15))
-                    .cornerRadius(15)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 15)
-                            .stroke(Color.white.opacity(soundOn ? 0 : 0.2), lineWidth: 1)
-                    )
-            }
-            .disabled(!service.daemonReady)
-
-            Button {
-                Task {
-                    await service.stopSound()
-                    soundOn = false
-                }
-            } label: {
-                Label("Stop", systemImage: "bell.slash.fill")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 17)
-                    .background(Color.white.opacity(0.10))
-                    .cornerRadius(15)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 15)
-                            .stroke(Color.white.opacity(0.2), lineWidth: 1)
-                    )
-            }
-            .disabled(!service.daemonReady)
-        }
+        .onAppear { service.start() }
     }
 }
 
-#Preview {
-    ContentView()
-}
+#Preview { ContentView() }
