@@ -3,16 +3,44 @@ import Combine
 
 private let kFindMyServiceUUID = CBUUID(string: "7DFC9000-7D1C-4951-86AA-8D9728F8D66C")
 private let kAppleNearbyUUID   = CBUUID(string: "FD44")
+private let kAirTagPSM: CBL2CAPPSM = 0x0101   // Durian L2CAP command channel
 private let kRSSI1m: Double    = -59
 private let kPathN:  Double    =  2.7
 private let kNamesKey          = "airtag_names_v1"
+
+// Sound sequence format per seemoo-lab/airtag research:
+//   Opcode 40 (0x28) = Play Sound Sequence
+//   Opcode  8 (0x08) = Stop Sound
+//   Payload format:  [sound_id(0-7), repetitions, length, pause]  × N entries
+//   Audible sounds:  4 and 5 (used by Find My's default "beep" sequence)
+enum SoundSequence: String, CaseIterable, Identifiable {
+    case classic   = "Classic"
+    case chirp     = "Chirp"
+    case repeated  = "Repeated"
+    case insistent = "Insistent"
+
+    var id: String { rawValue }
+
+    // Full L2CAP payload: opcode 0x28 + sequence entries
+    var bytes: [UInt8] {
+        switch self {
+        case .classic:   return [0x28, 0x04, 0x01, 0x00, 0x00, 0x05, 0x02, 0x00, 0x00]
+        case .chirp:     return [0x28, 0x04, 0x01, 0x00, 0x00]
+        case .repeated:  return [0x28, 0x04, 0x05, 0x00, 0x00]
+        case .insistent: return [0x28, 0x04, 0x01, 0x00, 0x00, 0x05, 0x05, 0x00, 0x00]
+        }
+    }
+
+    static let stopBytes: [UInt8] = [0x08]
+}
 
 struct FoundTag: Identifiable {
     let id: String          // CBPeripheral UUID string — stable per device
     var name: String
     var rssi: Int?
     var distance: Double?
-    var soundOn: Bool = false
+    var soundOn: Bool          = false
+    var selectedSound: SoundSequence = .classic
 }
 
 final class AirTagService: NSObject, ObservableObject {
@@ -41,14 +69,12 @@ final class AirTagService: NSObject, ObservableObject {
     @Published var state: State   = .off
     @Published var tags:  [FoundTag] = []
 
-    private var central:     CBCentralManager?
-    private var peripherals: [String: CBPeripheral] = [:]
-    private var rssiTimers:  [String: Timer] = [:]
-
-    // FindMy private framework items (FMFAItem objects), ordered as retrieved
-    private var fmItems: [NSObject] = []
-    // User-assigned names, keyed by peripheral UUID
-    private var nameMap: [String: String]
+    private var central:      CBCentralManager?
+    private var peripherals:  [String: CBPeripheral]    = [:]
+    private var l2capChannels:[String: CBL2CAPChannel]  = [:]
+    private var rssiTimers:   [String: Timer]           = [:]
+    private var fmItems:      [NSObject]                = []
+    private var nameMap:      [String: String]
 
     override init() {
         nameMap = (UserDefaults.standard.dictionary(forKey: kNamesKey) as? [String: String]) ?? [:]
@@ -69,14 +95,20 @@ final class AirTagService: NSObject, ObservableObject {
         mutateTag(id) { $0.name = name }
     }
 
+    func setSound(_ sound: SoundSequence, forTagID id: String) {
+        mutateTag(id) { $0.selectedSound = sound }
+    }
+
     func playSound(tagID: String) {
         mutateTag(tagID) { $0.soundOn = true }
-        triggerSound(tagID: tagID, play: true)
+        guard let tagIdx = tags.firstIndex(where: { $0.id == tagID }) else { return }
+        let seq = tags[tagIdx].selectedSound
+        sendL2CAPBytes(seq.bytes, tagID: tagID)
     }
 
     func stopSound(tagID: String) {
         mutateTag(tagID) { $0.soundOn = false }
-        triggerSound(tagID: tagID, play: false)
+        sendL2CAPBytes(SoundSequence.stopBytes, tagID: tagID)
     }
 
     // MARK: - Helpers
@@ -90,15 +122,30 @@ final class AirTagService: NSObject, ObservableObject {
         pow(10.0, (kRSSI1m - Double(rssi)) / (10.0 * kPathN))
     }
 
-    // MARK: - FindMy Private Framework
+    // MARK: - L2CAP Sound
+
+    private func sendL2CAPBytes(_ bytes: [UInt8], tagID: String) {
+        if let ch = l2capChannels[tagID] {
+            writeToChannel(ch, bytes: bytes)
+        } else if let p = peripherals[tagID] {
+            // Channel not yet open — open it, then send when ready
+            p.openL2CAPChannel(kAirTagPSM)
+        }
+    }
+
+    private func writeToChannel(_ ch: CBL2CAPChannel, bytes: [UInt8]) {
+        bytes.withUnsafeBufferPointer {
+            guard let base = $0.baseAddress else { return }
+            _ = ch.outputStream.write(base, maxLength: $0.count)
+        }
+    }
+
+    // MARK: - FindMy Private Framework (names only)
 
     private func loadFindMyItems() {
         guard let bundle = Bundle(path: "/System/Library/PrivateFrameworks/FindMy.framework"),
               bundle.load() else { return }
 
-        // Attempt to retrieve items from the local FindMy database.
-        // We try several plausible class/selector names because the private API
-        // isn't documented — the app degrades gracefully if none match.
         let dbClasses  = ["FMFAItemDatabase", "FMFABeaconDatabase",
                           "FMFAAccessoryDatabase", "FMFADatabase"]
         let sharedSels = ["sharedDatabase", "sharedInstance", "shared", "defaultDatabase"]
@@ -121,7 +168,6 @@ final class AirTagService: NSObject, ObservableObject {
         }
     }
 
-    // Return the FindMy-assigned name for the item at a given index, if available.
     private func fmName(at index: Int) -> String? {
         guard index < fmItems.count else { return nil }
         let obj = fmItems[index]
@@ -133,56 +179,6 @@ final class AirTagService: NSObject, ObservableObject {
         }
         return nil
     }
-
-    // Sound via FindMy private framework (handles owner-key authentication).
-    // Tries both item-level selectors and manager-level selectors with various
-    // plausible names.  If none match, sound silently does nothing.
-    private func triggerSound(tagID: String, play: Bool) {
-        guard let tagIdx = tags.firstIndex(where: { $0.id == tagID }),
-              tagIdx < fmItems.count else { return }
-
-        let item = fmItems[tagIdx]
-
-        // 1 — Try direct method on FMFAItem
-        let itemSels: [String] = play
-            ? ["requestAlertSound", "beginAlertSound", "startAlertSound",
-               "playAlertSound", "alert", "beginPlaying", "play", "startPlaying"]
-            : ["stopAlertSound",  "endAlertSound",   "cancelAlertSound",
-               "stopPlaying",     "stop",            "endAlert", "cancelAlert"]
-
-        for sel in itemSels {
-            let s = NSSelectorFromString(sel)
-            if item.responds(to: s) {
-                _ = item.perform(s)
-                return
-            }
-        }
-
-        // 2 — Try through a manager class
-        let managers   = ["FMFALocatingManager", "FMFAAlertingManager",
-                          "FMFABeaconManager", "FMFAAccessoryManager"]
-        let mgrShared  = ["sharedManager", "shared", "sharedInstance"]
-        let playSels   = ["startAlertingItem:", "alertItem:", "startAlerting:",
-                          "playAlertForItem:", "beginAlertingItem:"]
-        let stopSels   = ["stopAlertingItem:",  "stopAlert:",   "endAlertForItem:",
-                          "cancelAlertingItem:", "stopAlerting:"]
-        let actionSels = play ? playSels : stopSels
-
-        for className in managers {
-            guard let cls = NSClassFromString(className) as? NSObject.Type else { continue }
-            for sharedSel in mgrShared {
-                guard let mgr = cls.perform(NSSelectorFromString(sharedSel))?
-                                   .takeUnretainedValue() as? NSObject else { continue }
-                for actionSel in actionSels {
-                    let s = NSSelectorFromString(actionSel)
-                    if mgr.responds(to: s) {
-                        _ = mgr.perform(s, with: item)
-                        return
-                    }
-                }
-            }
-        }
-    }
 }
 
 // MARK: - CBCentralManagerDelegate
@@ -192,11 +188,9 @@ extension AirTagService: CBCentralManagerDelegate {
         guard central.state == .poweredOn else { state = .off; return }
         state = .scanning
         let svcUUIDs = [kFindMyServiceUUID, kAppleNearbyUUID]
-        // Grab AirTags already connected to locationd
         let existing = central.retrieveConnectedPeripherals(withServices: svcUUIDs)
         existing.forEach { registerAndConnect($0) }
         if !existing.isEmpty { state = .ready }
-        // Keep scanning for any additional AirTags
         central.scanForPeripherals(withServices: svcUUIDs, options: nil)
     }
 
@@ -208,20 +202,20 @@ extension AirTagService: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         state = .ready
         startRSSI(for: peripheral)
+        peripheral.openL2CAPChannel(kAirTagPSM)
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral,
-                        error: Error?) {
-        // Will retry on next scan result
-    }
+                        error: Error?) { }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
         let id = peripheral.identifier.uuidString
         rssiTimers[id]?.invalidate()
         rssiTimers.removeValue(forKey: id)
+        l2capChannels.removeValue(forKey: id)
         mutateTag(id) { t in t.rssi = nil; t.distance = nil; t.soundOn = false }
-        central.connect(peripheral, options: nil) // auto-reconnect
+        central.connect(peripheral, options: nil)
     }
 
     private func registerAndConnect(_ p: CBPeripheral) {
@@ -229,7 +223,6 @@ extension AirTagService: CBCentralManagerDelegate {
         guard peripherals[id] == nil else { return }
         peripherals[id] = p
         p.delegate = self
-        // Name priority: user-saved > FindMy index-match > fallback label
         let tagIndex = tags.count
         let name = nameMap[id]
                 ?? fmName(at: tagIndex)
@@ -253,10 +246,22 @@ extension AirTagService: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
         guard error == nil, RSSI.intValue < 0 else { return }
         let id = peripheral.identifier.uuidString
-        let meters = toMeters(RSSI.intValue)
-        mutateTag(id) { t in
-            t.rssi     = RSSI.intValue
-            t.distance = meters
+        let m = toMeters(RSSI.intValue)
+        mutateTag(id) { t in t.rssi = RSSI.intValue; t.distance = m }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
+        guard let ch = channel else { return }
+        let id = peripheral.identifier.uuidString
+        l2capChannels[id] = ch
+        // Schedule both streams on the common run-loop mode so they work during UI interaction
+        ch.inputStream.schedule(in: .main, forMode: .common)
+        ch.outputStream.schedule(in: .main, forMode: .common)
+        ch.inputStream.open()
+        ch.outputStream.open()
+        // Deliver any pending sound command that triggered the channel open
+        if let tagIdx = tags.firstIndex(where: { $0.id == id }), tags[tagIdx].soundOn {
+            writeToChannel(ch, bytes: tags[tagIdx].selectedSound.bytes)
         }
     }
 }

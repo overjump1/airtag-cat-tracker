@@ -2,8 +2,8 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var service = AirTagService()
-    @State private var renamingID:  String? = nil
-    @State private var renameText:  String  = ""
+    @State private var renamingID: String? = nil
+    @State private var renameText: String  = ""
 
     var body: some View {
         ZStack {
@@ -11,7 +11,7 @@ struct ContentView: View {
 
             VStack(spacing: 0) {
 
-                // ── Header bar ────────────────────────────────────────────────
+                // ── Header ────────────────────────────────────────────────────
                 HStack(spacing: 6) {
                     if service.state == .scanning {
                         ProgressView().scaleEffect(0.6).tint(.orange)
@@ -38,7 +38,7 @@ struct ContentView: View {
                     Spacer()
                     VStack(spacing: 14) {
                         ProgressView().tint(.orange).scaleEffect(1.2)
-                        Text("Looking for your AirTags…")
+                        Text("Looking for AirTags…")
                             .font(.system(size: 14))
                             .foregroundColor(.white.opacity(0.45))
                     }
@@ -49,11 +49,14 @@ struct ContentView: View {
                             ForEach(service.tags) { tag in
                                 TagCard(
                                     tag: tag,
-                                    onPlay:   { service.playSound(tagID: tag.id) },
-                                    onStop:   { service.stopSound(tagID: tag.id) },
-                                    onRename: {
+                                    onPlay:      { service.playSound(tagID: tag.id) },
+                                    onStop:      { service.stopSound(tagID: tag.id) },
+                                    onRename:    {
                                         renameText = tag.name
                                         renamingID = tag.id
+                                    },
+                                    onPickSound: { seq in
+                                        service.setSound(seq, forTagID: tag.id)
                                     }
                                 )
                             }
@@ -83,9 +86,10 @@ struct ContentView: View {
 
 struct TagCard: View {
     let tag: FoundTag
-    let onPlay:   () -> Void
-    let onStop:   () -> Void
-    let onRename: () -> Void
+    let onPlay:      () -> Void
+    let onStop:      () -> Void
+    let onRename:    () -> Void
+    let onPickSound: (SoundSequence) -> Void
 
     private var ringColor: Color {
         guard let d = tag.distance else { return .gray }
@@ -118,7 +122,7 @@ struct TagCard: View {
     var body: some View {
         VStack(spacing: 16) {
 
-            // Name + rename button
+            // ── Name row ──────────────────────────────────────────────────
             HStack(alignment: .center) {
                 Text(tag.name)
                     .font(.system(size: 17, weight: .semibold))
@@ -133,11 +137,11 @@ struct TagCard: View {
                 if let rssi = tag.rssi {
                     Text("\(rssi) dBm")
                         .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.3))
+                        .foregroundColor(.white.opacity(0.28))
                 }
             }
 
-            // Proximity ring
+            // ── Proximity ring ────────────────────────────────────────────
             ZStack {
                 Circle()
                     .stroke(ringColor.opacity(0.18), lineWidth: 1.5)
@@ -160,19 +164,35 @@ struct TagCard: View {
                 .font(.system(size: 13, weight: .medium))
                 .foregroundColor(ringColor)
 
-            // Sound controls
+            // ── Sound sequence picker ─────────────────────────────────────
+            Picker("Sound", selection: Binding(
+                get: { tag.selectedSound },
+                set: { onPickSound($0) }
+            )) {
+                ForEach(SoundSequence.allCases) { seq in
+                    Text(seq.rawValue).tag(seq)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(tag.soundOn)
+
+            // ── Sound controls ────────────────────────────────────────────
             HStack(spacing: 10) {
                 Button(action: onPlay) {
-                    Label("Play Sound", systemImage: "speaker.wave.2.fill")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(tag.soundOn ? .orange : .white)
-                        .padding(.horizontal, 18)
-                        .padding(.vertical, 10)
-                        .background(tag.soundOn
-                            ? Color.orange.opacity(0.22)
-                            : Color.white.opacity(0.09))
-                        .clipShape(Capsule())
+                    Label(
+                        tag.soundOn ? "Playing…" : "Play Sound",
+                        systemImage: tag.soundOn ? "speaker.wave.3.fill" : "speaker.wave.2.fill"
+                    )
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(tag.soundOn ? .orange : .white)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 10)
+                    .background(tag.soundOn
+                        ? Color.orange.opacity(0.22)
+                        : Color.white.opacity(0.09))
+                    .clipShape(Capsule())
                 }
+
                 if tag.soundOn {
                     Button(action: onStop) {
                         Label("Stop", systemImage: "stop.fill")
@@ -209,7 +229,7 @@ struct RenameSheet: View {
                         .autocorrectionDisabled()
                 }
                 Section {
-                    Text("This name is saved only on this device.")
+                    Text("Saved only on this device.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
