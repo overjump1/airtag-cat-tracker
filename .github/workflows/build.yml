@@ -1,0 +1,54 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - name: Build (unsigned, arm64)
+        working-directory: AirTagCat
+        run: |
+          xcodebuild \
+            -project AirTagCat.xcodeproj \
+            -scheme AirTagCat \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath ./DerivedData \
+            ONLY_ACTIVE_ARCH=NO \
+            ARCHS=arm64 \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package IPA
+        run: |
+          APP="AirTagCat/DerivedData/Build/Products/Release-iphoneos/AirTagCat.app"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qr AirTagCat.ipa Payload/
+          rm -rf Payload
+          echo "Built: $(du -sh AirTagCat.ipa | cut -f1)"
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v$(date +'%Y%m%d-%H%M%S')"
+          gh release create "$TAG" AirTagCat.ipa \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "AirTagCat $TAG" \
+            --notes $'Unsigned IPA — install via TrollStore or re-sign with Sideloadly.\n\n**Install via TrollStore:** AirDrop the IPA to your iPhone, open with TrollStore.\n**Install via Sideloadly:** Connect iPhone to Mac, open Sideloadly, drag IPA in.' \
+            --latest
