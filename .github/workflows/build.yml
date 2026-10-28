@@ -26,16 +26,16 @@ jobs:
             -target AirTagCat \
             -sdk iphoneos \
             -configuration Release \
-            -derivedDataPath ./DerivedData \
             ONLY_ACTIVE_ARCH=NO \
             ARCHS=arm64 \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO \
+            SYMROOT="$(pwd)/build"
 
       - name: Package IPA
         run: |
-          APP="AirTagCat/DerivedData/Build/Products/Release-iphoneos/AirTagCat.app"
+          APP="AirTagCat/build/Release-iphoneos/AirTagCat.app"
           mkdir -p Payload
           cp -R "$APP" Payload/
           zip -qr AirTagCat.ipa Payload/
