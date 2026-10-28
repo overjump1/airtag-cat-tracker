@@ -88,6 +88,7 @@ final class AirTagService: NSObject, ObservableObject {
 
     func start() {
         loadFindMyItems()
+        probeDurianDevices()
         central = CBCentralManager(delegate: self, queue: .main)
     }
 
@@ -146,11 +147,32 @@ final class AirTagService: NSObject, ObservableObject {
         central?.connect(p, options: nil)
     }
 
-    /// Pulls currently-connected system peripherals that have the Find My service.
+    /// Pulls currently-connected system peripherals that could be AirTags.
     private func checkConnectedPeripherals() {
-        let svcUUIDs = [kFindMyServiceUUID, kAppleNearbyUUID]
-        central?.retrieveConnectedPeripherals(withServices: svcUUIDs)
-               .forEach { addVerifiedPeripheral($0) }
+        // Fast path: locationd performed GATT discovery and the Find My UUID is registered
+        let specific = central?.retrieveConnectedPeripherals(
+            withServices: [kFindMyServiceUUID, kAppleNearbyUUID]) ?? []
+        specific.forEach { addVerifiedPeripheral($0) }
+
+        // Slow path: locationd opened L2CAP directly without GATT discovery, so no
+        // Find My UUID is registered. Generic services (0x1800/0x1801/0x180A) are
+        // cached by the BLE stack for every connected peripheral regardless.
+        let generic = central?.retrieveConnectedPeripherals(withServices: [
+            CBUUID(string: "1800"),   // Generic Access   — on every BLE device
+            CBUUID(string: "1801"),   // Generic Attribute — on every BLE device
+            CBUUID(string: "180A"),   // Device Information — on most BLE devices
+        ]) ?? []
+        generic
+            .filter { peripherals[$0.identifier.uuidString] == nil }  // not yet verified
+            .forEach { connectCandidate($0) }
+    }
+
+    private func connectCandidate(_ p: CBPeripheral) {
+        let id = p.identifier.uuidString
+        guard peripherals[id] == nil, !candidates.contains(id) else { return }
+        candidates.insert(id)
+        p.delegate = self
+        central?.connect(p, options: nil)
     }
 
     // MARK: - L2CAP Sound
@@ -172,6 +194,41 @@ final class AirTagService: NSObject, ObservableObject {
         bytes.withUnsafeBufferPointer {
             guard let base = $0.baseAddress else { return }
             _ = ch.outputStream.write(base, maxLength: $0.count)
+        }
+    }
+
+    // MARK: - CLDurian private CoreLocation probe
+    // locationd manages AirTags via CLDurianDeviceManager/CLDurianService inside its own
+    // process. Those classes live in CoreLocation.framework which is loaded in every app.
+    // On a jailbroken/no-sandbox device the XPC connection they make to locationd may give
+    // us direct access to the already-connected CLDurianDevice objects — each wraps a
+    // CBPeripheral we can hand straight to addVerifiedPeripheral().
+
+    private func probeDurianDevices() {
+        // Try all plausible manager/service class names and singleton selectors
+        let classes   = ["CLDurianDeviceManager","CLDurianService","CLDurianManager","CLDurianController"]
+        let sharedSel = ["sharedManager","sharedService","sharedInstance","shared","defaultManager","defaultService"]
+        let deviceSel = ["devices","connectedDevices","allDevices","knownDevices","peripherals","accessories"]
+        let periphSel = ["peripheral","cbPeripheral","bluetoothPeripheral","centralPeripheral"]
+
+        for cls in classes {
+            guard let c = NSClassFromString(cls) as? NSObject.Type else { continue }
+            for ss in sharedSel {
+                guard let mgr = c.perform(NSSelectorFromString(ss))?.takeUnretainedValue() as? NSObject else { continue }
+                for ds in deviceSel {
+                    guard let list = mgr.perform(NSSelectorFromString(ds))?.takeUnretainedValue() as? [NSObject],
+                          !list.isEmpty else { continue }
+                    for device in list {
+                        for ps in periphSel {
+                            if let p = device.perform(NSSelectorFromString(ps))?.takeUnretainedValue() as? CBPeripheral {
+                                // Got a CBPeripheral directly from locationd's device manager
+                                addVerifiedPeripheral(p)
+                            }
+                        }
+                    }
+                    return  // found the device list; stop searching
+                }
+            }
         }
     }
 
@@ -219,8 +276,10 @@ extension AirTagService: CBCentralManagerDelegate {
 
         // AirTags in paired mode do NOT include the Find My UUID in their adv packets —
         // they only expose it via GATT after connecting. Scanning with nil catches them.
+        // allowDuplicates:true keeps re-reporting the AirTag on each adv packet so we
+        // don't miss it if the first advertisement fires before we call connect().
         central.scanForPeripherals(withServices: nil,
-                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
 
         // locationd connects AirTags intermittently (every ~15 s); keep checking
         connectedTimer?.invalidate()
