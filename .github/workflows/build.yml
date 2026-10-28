@@ -30,7 +30,7 @@ jobs:
             ARCHS=arm64 \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_ENTITLEMENTS="AirTagCat/AirTagCat.entitlements" \
             SYMROOT="$(pwd)/build"
 
       - name: Package IPA

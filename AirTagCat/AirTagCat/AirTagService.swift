@@ -69,12 +69,18 @@ final class AirTagService: NSObject, ObservableObject {
     @Published var state: State   = .off
     @Published var tags:  [FoundTag] = []
 
-    private var central:      CBCentralManager?
-    private var peripherals:  [String: CBPeripheral]    = [:]
-    private var l2capChannels:[String: CBL2CAPChannel]  = [:]
-    private var rssiTimers:   [String: Timer]           = [:]
-    private var fmItems:      [NSObject]                = []
-    private var nameMap:      [String: String]
+    private var central:        CBCentralManager?
+    private var peripherals:    [String: CBPeripheral]   = [:]
+    private var l2capChannels:  [String: CBL2CAPChannel] = [:]
+    private var pendingWrites:  [String: [UInt8]]        = [:]
+    private var rssiTimers:     [String: Timer]          = [:]
+    private var smoothedRSSI:   [String: Double]         = [:]
+    private var fmItems:        [NSObject]               = []
+    private var nameMap:        [String: String]
+
+    // EMA factor: 0.15 gives ~6-sample lag which smooths the wild RSSI swings
+    // without making the indicator feel unresponsive to real movement
+    private let kEMAAlpha: Double = 0.15
 
     override init() {
         nameMap = (UserDefaults.standard.dictionary(forKey: kNamesKey) as? [String: String]) ?? [:]
@@ -102,12 +108,12 @@ final class AirTagService: NSObject, ObservableObject {
     func playSound(tagID: String) {
         mutateTag(tagID) { $0.soundOn = true }
         guard let tagIdx = tags.firstIndex(where: { $0.id == tagID }) else { return }
-        let seq = tags[tagIdx].selectedSound
-        sendL2CAPBytes(seq.bytes, tagID: tagID)
+        sendL2CAPBytes(tags[tagIdx].selectedSound.bytes, tagID: tagID)
     }
 
     func stopSound(tagID: String) {
         mutateTag(tagID) { $0.soundOn = false }
+        pendingWrites.removeValue(forKey: tagID)
         sendL2CAPBytes(SoundSequence.stopBytes, tagID: tagID)
     }
 
@@ -126,9 +132,13 @@ final class AirTagService: NSObject, ObservableObject {
 
     private func sendL2CAPBytes(_ bytes: [UInt8], tagID: String) {
         if let ch = l2capChannels[tagID] {
-            writeToChannel(ch, bytes: bytes)
+            if ch.outputStream.hasSpaceAvailable {
+                writeToChannel(ch, bytes: bytes)
+            } else {
+                pendingWrites[tagID] = bytes   // deliver via StreamDelegate when ready
+            }
         } else if let p = peripherals[tagID] {
-            // Channel not yet open — open it, then send when ready
+            pendingWrites[tagID] = bytes        // deliver via didOpen
             p.openL2CAPChannel(kAirTagPSM)
         }
     }
@@ -214,6 +224,8 @@ extension AirTagService: CBCentralManagerDelegate {
         rssiTimers[id]?.invalidate()
         rssiTimers.removeValue(forKey: id)
         l2capChannels.removeValue(forKey: id)
+        smoothedRSSI.removeValue(forKey: id)
+        pendingWrites.removeValue(forKey: id)
         mutateTag(id) { t in t.rssi = nil; t.distance = nil; t.soundOn = false }
         central.connect(peripheral, options: nil)
     }
@@ -246,22 +258,38 @@ extension AirTagService: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
         guard error == nil, RSSI.intValue < 0 else { return }
         let id = peripheral.identifier.uuidString
-        let m = toMeters(RSSI.intValue)
-        mutateTag(id) { t in t.rssi = RSSI.intValue; t.distance = m }
+        let raw = Double(RSSI.intValue)
+        let ema = smoothedRSSI[id].map { kEMAAlpha * raw + (1 - kEMAAlpha) * $0 } ?? raw
+        smoothedRSSI[id] = ema
+        let display = Int(ema.rounded())
+        mutateTag(id) { t in t.rssi = display; t.distance = toMeters(display) }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
         guard let ch = channel else { return }
         let id = peripheral.identifier.uuidString
         l2capChannels[id] = ch
-        // Schedule both streams on the common run-loop mode so they work during UI interaction
+        ch.inputStream.delegate  = self
+        ch.outputStream.delegate = self
         ch.inputStream.schedule(in: .main, forMode: .common)
         ch.outputStream.schedule(in: .main, forMode: .common)
         ch.inputStream.open()
         ch.outputStream.open()
-        // Deliver any pending sound command that triggered the channel open
-        if let tagIdx = tags.firstIndex(where: { $0.id == id }), tags[tagIdx].soundOn {
-            writeToChannel(ch, bytes: tags[tagIdx].selectedSound.bytes)
+        // If the stream is immediately ready, flush any pending write now;
+        // otherwise StreamDelegate will fire .hasSpaceAvailable and flush it
+        if ch.outputStream.hasSpaceAvailable, let bytes = pendingWrites.removeValue(forKey: id) {
+            writeToChannel(ch, bytes: bytes)
         }
     }
+}
+
+// MARK: - StreamDelegate (L2CAP output stream ready)
+extension AirTagService: StreamDelegate {
+    func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
+        guard eventCode.contains(.hasSpaceAvailable) else { return }
+        guard let (id, ch) = l2capChannels.first(where: { $0.value.outputStream === aStream }),
+              let bytes = pendingWrites.removeValue(forKey: id) else { return }
+        writeToChannel(ch, bytes: bytes)
+    }
+}
 }
