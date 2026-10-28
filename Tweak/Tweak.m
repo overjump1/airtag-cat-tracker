@@ -11,6 +11,7 @@
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <sys/socket.h>
 #import <sys/un.h>
 #import <sys/stat.h>

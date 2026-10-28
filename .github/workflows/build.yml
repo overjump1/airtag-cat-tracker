@@ -17,7 +17,7 @@ jobs:
     strategy:
       matrix:
         runner: [macos-13, macos-14, macos-15]
-      fail-fast: true    # stop the others as soon as one succeeds
+      fail-fast: false   # let all runners try; first to finish publishes the release
     continue-on-error: false
 
     steps:
@@ -97,9 +97,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="v$(date +'%Y%m%d-%H%M%S')"
+          # Use commit SHA so duplicate runners don't create conflicting tags
+          TAG="v$(git rev-parse --short HEAD)"
           gh release create "$TAG" AirTagCat.deb \
             --repo "$GITHUB_REPOSITORY" \
             --title "AirTagCat $TAG" \
             --notes $'**Requires Dopamine jailbreak (iOS 15 – 16.6.1)**\n\n## Install\n1. AirDrop or SSH the `.deb` to your iPhone\n2. Open it with **Sileo** → install\n3. Respring when prompted — locationd restarts automatically\n4. Open **AirTagCat** from the home screen\n\nThe app reads AirTag data directly from `locationd`. No BLE scanning needed.' \
-            --latest
+            --latest 2>/dev/null \
+          || gh release upload "$TAG" AirTagCat.deb --clobber
