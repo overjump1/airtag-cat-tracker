@@ -10,7 +10,15 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-13
+    # Any macOS runner works — no Theos, no special toolchain needed.
+    # macos-13, macos-14, macos-15 are all fine; use the matrix so whichever
+    # GitHub has capacity for picks up the job first.
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [macos-13, macos-14, macos-15]
+      fail-fast: true    # stop the others as soon as one succeeds
+    continue-on-error: false
 
     steps:
       - uses: actions/checkout@v4
@@ -18,20 +26,8 @@ jobs:
       - name: Xcode version
         run: xcodebuild -version
 
-      # ── Set up Theos ────────────────────────────────────────────────────────
-      - name: Install Theos
-        run: |
-          brew install ldid make dpkg
-          git clone --recursive https://github.com/theos/theos $HOME/theos
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-          # Link Xcode's iOS SDK into Theos's sdks directory
-          SDK=$(xcrun --show-sdk-path --sdk iphoneos)
-          VER=$(xcrun --show-sdk-version --sdk iphoneos)
-          mkdir -p $HOME/theos/sdks
-          ln -sf "$SDK" "$HOME/theos/sdks/iPhoneOS${VER}.sdk"
-
-      # ── Build the Swift app (unsigned arm64) ────────────────────────────────
-      - name: Build app
+      # ── Swift app ──────────────────────────────────────────────────────────
+      - name: Build app (unsigned arm64)
         working-directory: AirTagCat
         run: |
           xcodebuild \
@@ -52,34 +48,57 @@ jobs:
             --entitlements AirTagCat/AirTagCat/AirTagCat.entitlements \
             AirTagCat/build/Release-iphoneos/AirTagCat.app
 
-      # ── Stage app into Theos layout so it ships inside the .deb ────────────
-      - name: Stage app in Theos layout
+      # ── Tweak dylib (plain clang, no Theos) ───────────────────────────────
+      - name: Build tweak dylib
         run: |
-          mkdir -p Tweak/layout/var/jb/Applications
-          cp -R AirTagCat/build/Release-iphoneos/AirTagCat.app \
-                Tweak/layout/var/jb/Applications/AirTagCat.app
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -dynamiclib \
+            -fno-objc-arc \
+            -fobjc-exceptions \
+            -framework Foundation \
+            -o Tweak/AirTagCatTweak.dylib \
+            Tweak/Tweak.m
+          codesign -f -s "-" Tweak/AirTagCatTweak.dylib
 
-      # ── Build the Theos package (tweak dylib + app = combined .deb) ─────────
-      - name: Build Theos package
-        working-directory: Tweak
+      # ── Assemble .deb manually (no Theos packaging needed) ────────────────
+      - name: Package .deb
         run: |
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          R=$(mktemp -d)
+          mkdir -p "$R/DEBIAN"
+          mkdir -p "$R/var/jb/Library/MobileSubstrate/DynamicLibraries"
+          mkdir -p "$R/var/jb/Applications"
 
-      - name: Locate .deb
-        id: deb
-        run: |
-          FILE=$(ls Tweak/packages/*.deb | head -1)
-          echo "path=$FILE" >> $GITHUB_OUTPUT
-          echo "name=$(basename $FILE)" >> $GITHUB_OUTPUT
-          echo "size=$(du -sh $FILE | cut -f1)" >> $GITHUB_OUTPUT
+          cp Tweak/AirTagCatTweak.dylib  "$R/var/jb/Library/MobileSubstrate/DynamicLibraries/"
+          cp Tweak/AirTagCatTweak.plist  "$R/var/jb/Library/MobileSubstrate/DynamicLibraries/"
+          cp -R AirTagCat/build/Release-iphoneos/AirTagCat.app "$R/var/jb/Applications/"
 
-      # ── Publish GitHub Release ───────────────────────────────────────────────
+          # Strip leading whitespace that heredoc indentation adds
+          sed 's/^          //' > "$R/DEBIAN/control" << 'CTRL'
+          Package: com.local.airtagcat
+          Name: AirTagCat
+          Version: 1.0
+          Architecture: iphoneos-arm64
+          Description: Track your cat's AirTag — hooks locationd for real proximity
+          Maintainer: AirTagCat <noreply@local>
+          Author: AirTagCat
+          Section: Tweaks
+          Depends: mobilesubstrate | libhooker | substitute
+          CTRL
+
+          install -m 755 Tweak/postinst "$R/DEBIAN/postinst"
+
+          brew install dpkg 2>/dev/null || true
+          dpkg-deb --build "$R" AirTagCat.deb
+          echo "size=$(du -sh AirTagCat.deb | cut -f1)"
+
+      # ── Release ───────────────────────────────────────────────────────────
       - name: Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="v$(date +'%Y%m%d-%H%M%S')"
-          gh release create "$TAG" "${{ steps.deb.outputs.path }}" \
+          gh release create "$TAG" AirTagCat.deb \
             --repo "$GITHUB_REPOSITORY" \
             --title "AirTagCat $TAG" \
             --notes $'**Requires Dopamine jailbreak (iOS 15 – 16.6.1)**\n\n## Install\n1. AirDrop or SSH the `.deb` to your iPhone\n2. Open it with **Sileo** → install\n3. Respring when prompted — locationd restarts automatically\n4. Open **AirTagCat** from the home screen\n\nThe app reads AirTag data directly from `locationd`. No BLE scanning needed.' \
