@@ -3,16 +3,11 @@ import Combine
 
 private let kFindMyServiceUUID = CBUUID(string: "7DFC9000-7D1C-4951-86AA-8D9728F8D66C")
 private let kAppleNearbyUUID   = CBUUID(string: "FD44")
-private let kAirTagPSM: CBL2CAPPSM = 0x0101   // Durian L2CAP command channel
+private let kAirTagPSM: CBL2CAPPSM = 0x0101
 private let kRSSI1m: Double    = -59
 private let kPathN:  Double    =  2.7
 private let kNamesKey          = "airtag_names_v1"
 
-// Sound sequence format per seemoo-lab/airtag research:
-//   Opcode 40 (0x28) = Play Sound Sequence
-//   Opcode  8 (0x08) = Stop Sound
-//   Payload format:  [sound_id(0-7), repetitions, length, pause]  × N entries
-//   Audible sounds:  4 and 5 (used by Find My's default "beep" sequence)
 enum SoundSequence: String, CaseIterable, Identifiable {
     case classic   = "Classic"
     case chirp     = "Chirp"
@@ -21,7 +16,6 @@ enum SoundSequence: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    // Full L2CAP payload: opcode 0x28 + sequence entries
     var bytes: [UInt8] {
         switch self {
         case .classic:   return [0x28, 0x04, 0x01, 0x00, 0x00, 0x05, 0x02, 0x00, 0x00]
@@ -35,12 +29,12 @@ enum SoundSequence: String, CaseIterable, Identifiable {
 }
 
 struct FoundTag: Identifiable {
-    let id: String          // CBPeripheral UUID string — stable per device
+    let id: String
     var name: String
     var rssi: Int?
     var distance: Double?
-    var soundOn: Bool          = false
-    var selectedSound: SoundSequence = .classic
+    var soundOn: Bool                   = false
+    var selectedSound: SoundSequence   = .classic
 }
 
 final class AirTagService: NSObject, ObservableObject {
@@ -59,27 +53,30 @@ final class AirTagService: NSObject, ObservableObject {
         var label: String {
             switch self {
             case .off:          return "Bluetooth off"
-            case .scanning:     return "Scanning…"
+            case .scanning:     return "Looking for AirTags…"
             case .ready:        return "Active"
             case .error(let s): return s
             }
         }
     }
 
-    @Published var state: State   = .off
+    @Published var state: State      = .off
     @Published var tags:  [FoundTag] = []
 
-    private var central:        CBCentralManager?
-    private var peripherals:    [String: CBPeripheral]   = [:]
-    private var l2capChannels:  [String: CBL2CAPChannel] = [:]
-    private var pendingWrites:  [String: [UInt8]]        = [:]
-    private var rssiTimers:     [String: Timer]          = [:]
-    private var smoothedRSSI:   [String: Double]         = [:]
-    private var fmItems:        [NSObject]               = []
-    private var nameMap:        [String: String]
+    // Verified Find My peripherals
+    private var peripherals:   [String: CBPeripheral]   = [:]
+    // Apple-manufacturer peripherals we connected but haven't verified yet
+    private var candidates:    Set<String>              = []
+    private var l2capChannels: [String: CBL2CAPChannel] = [:]
+    private var pendingWrites: [String: [UInt8]]        = [:]
+    private var rssiTimers:    [String: Timer]          = [:]
+    private var smoothedRSSI:  [String: Double]         = [:]
+    private var connectedTimer: Timer?
+    private var fmItems:       [NSObject]               = []
+    private var nameMap:       [String: String]
+    private var central:       CBCentralManager?
 
-    // EMA factor: 0.15 gives ~6-sample lag which smooths the wild RSSI swings
-    // without making the indicator feel unresponsive to real movement
+    // EMA α=0.15 ≈ 6-sample smoothing; kills the 0.5 m ↔ 21 m RSSI jitter
     private let kEMAAlpha: Double = 0.15
 
     override init() {
@@ -107,8 +104,8 @@ final class AirTagService: NSObject, ObservableObject {
 
     func playSound(tagID: String) {
         mutateTag(tagID) { $0.soundOn = true }
-        guard let tagIdx = tags.firstIndex(where: { $0.id == tagID }) else { return }
-        sendL2CAPBytes(tags[tagIdx].selectedSound.bytes, tagID: tagID)
+        guard let idx = tags.firstIndex(where: { $0.id == tagID }) else { return }
+        sendL2CAPBytes(tags[idx].selectedSound.bytes, tagID: tagID)
     }
 
     func stopSound(tagID: String) {
@@ -128,6 +125,34 @@ final class AirTagService: NSObject, ObservableObject {
         pow(10.0, (kRSSI1m - Double(rssi)) / (10.0 * kPathN))
     }
 
+    // MARK: - Verified peripheral management
+
+    /// Adds a peripheral that has been confirmed to have the Find My GATT service.
+    private func addVerifiedPeripheral(_ p: CBPeripheral) {
+        let id = p.identifier.uuidString
+        guard peripherals[id] == nil else { return }
+        peripherals[id] = p
+        candidates.remove(id)
+        p.delegate = self
+        if !tags.contains(where: { $0.id == id }) {
+            let idx  = tags.count
+            let name = nameMap[id]
+                    ?? fmName(at: idx)
+                    ?? (idx == 0 ? "AirTag" : "AirTag \(idx + 1)")
+            tags.append(FoundTag(id: id, name: name))
+        }
+        state = .ready
+        // Connect (or re-use existing connection) to start RSSI + L2CAP
+        central?.connect(p, options: nil)
+    }
+
+    /// Pulls currently-connected system peripherals that have the Find My service.
+    private func checkConnectedPeripherals() {
+        let svcUUIDs = [kFindMyServiceUUID, kAppleNearbyUUID]
+        central?.retrieveConnectedPeripherals(withServices: svcUUIDs)
+               .forEach { addVerifiedPeripheral($0) }
+    }
+
     // MARK: - L2CAP Sound
 
     private func sendL2CAPBytes(_ bytes: [UInt8], tagID: String) {
@@ -135,10 +160,10 @@ final class AirTagService: NSObject, ObservableObject {
             if ch.outputStream.hasSpaceAvailable {
                 writeToChannel(ch, bytes: bytes)
             } else {
-                pendingWrites[tagID] = bytes   // deliver via StreamDelegate when ready
+                pendingWrites[tagID] = bytes
             }
         } else if let p = peripherals[tagID] {
-            pendingWrites[tagID] = bytes        // deliver via didOpen
+            pendingWrites[tagID] = bytes
             p.openL2CAPChannel(kAirTagPSM)
         }
     }
@@ -155,23 +180,16 @@ final class AirTagService: NSObject, ObservableObject {
     private func loadFindMyItems() {
         guard let bundle = Bundle(path: "/System/Library/PrivateFrameworks/FindMy.framework"),
               bundle.load() else { return }
-
-        let dbClasses  = ["FMFAItemDatabase", "FMFABeaconDatabase",
-                          "FMFAAccessoryDatabase", "FMFADatabase"]
-        let sharedSels = ["sharedDatabase", "sharedInstance", "shared", "defaultDatabase"]
-        let itemsSels  = ["items", "allItems", "accessories", "allAccessories",
-                          "beacons", "allBeacons"]
-
-        outer: for className in dbClasses {
-            guard let cls = NSClassFromString(className) as? NSObject.Type else { continue }
-            for sharedSel in sharedSels {
-                guard let db = cls.perform(NSSelectorFromString(sharedSel))?
-                                  .takeUnretainedValue() as? NSObject else { continue }
-                for itemsSel in itemsSels {
-                    if let list = db.perform(NSSelectorFromString(itemsSel))?
-                                    .takeUnretainedValue() as? [NSObject], !list.isEmpty {
-                        fmItems = list
-                        break outer
+        let dbClasses  = ["FMFAItemDatabase","FMFABeaconDatabase","FMFAAccessoryDatabase","FMFADatabase"]
+        let sharedSels = ["sharedDatabase","sharedInstance","shared","defaultDatabase"]
+        let itemsSels  = ["items","allItems","accessories","allAccessories","beacons","allBeacons"]
+        outer: for cls in dbClasses {
+            guard let c = NSClassFromString(cls) as? NSObject.Type else { continue }
+            for ss in sharedSels {
+                guard let db = c.perform(NSSelectorFromString(ss))?.takeUnretainedValue() as? NSObject else { continue }
+                for is_ in itemsSels {
+                    if let list = db.perform(NSSelectorFromString(is_))?.takeUnretainedValue() as? [NSObject], !list.isEmpty {
+                        fmItems = list; break outer
                     }
                 }
             }
@@ -181,42 +199,64 @@ final class AirTagService: NSObject, ObservableObject {
     private func fmName(at index: Int) -> String? {
         guard index < fmItems.count else { return nil }
         let obj = fmItems[index]
-        for sel in ["name", "displayName", "title", "localizedName"] {
-            if let s = obj.perform(NSSelectorFromString(sel))?
-                          .takeUnretainedValue() as? String, !s.isEmpty {
-                return s
-            }
+        for sel in ["name","displayName","title","localizedName"] {
+            if let s = obj.perform(NSSelectorFromString(sel))?.takeUnretainedValue() as? String, !s.isEmpty { return s }
         }
         return nil
     }
 }
 
 // MARK: - CBCentralManagerDelegate
+
 extension AirTagService: CBCentralManagerDelegate {
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         guard central.state == .poweredOn else { state = .off; return }
         state = .scanning
-        let svcUUIDs = [kFindMyServiceUUID, kAppleNearbyUUID]
-        let existing = central.retrieveConnectedPeripherals(withServices: svcUUIDs)
-        existing.forEach { registerAndConnect($0) }
-        if !existing.isEmpty { state = .ready }
-        central.scanForPeripherals(withServices: svcUUIDs, options: nil)
+
+        // Primary: system-connected peripherals (locationd already found them)
+        checkConnectedPeripherals()
+
+        // AirTags in paired mode do NOT include the Find My UUID in their adv packets —
+        // they only expose it via GATT after connecting. Scanning with nil catches them.
+        central.scanForPeripherals(withServices: nil,
+                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+
+        // locationd connects AirTags intermittently (every ~15 s); keep checking
+        connectedTimer?.invalidate()
+        connectedTimer = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: true) { [weak self] _ in
+            self?.checkConnectedPeripherals()
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        registerAndConnect(peripheral)
+        // Filter to Apple-manufactured devices only (company ID 0x004C = [0x4C, 0x00])
+        guard let mfr = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
+              mfr.count >= 2, mfr[0] == 0x4C, mfr[1] == 0x00 else { return }
+        let id = peripheral.identifier.uuidString
+        guard peripherals[id] == nil, !candidates.contains(id) else { return }
+        candidates.insert(id)
+        peripheral.delegate = self
+        central.connect(peripheral, options: nil)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        state = .ready
-        startRSSI(for: peripheral)
-        peripheral.openL2CAPChannel(kAirTagPSM)
+        let id = peripheral.identifier.uuidString
+        if peripherals[id] != nil {
+            // Already a verified Find My device — start monitoring
+            startRSSI(for: peripheral)
+            peripheral.openL2CAPChannel(kAirTagPSM)
+        } else {
+            // Candidate from nil scan — verify it has the Find My service
+            peripheral.discoverServices([kFindMyServiceUUID])
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral,
-                        error: Error?) { }
+                        error: Error?) {
+        candidates.remove(peripheral.identifier.uuidString)
+    }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
@@ -227,20 +267,9 @@ extension AirTagService: CBCentralManagerDelegate {
         smoothedRSSI.removeValue(forKey: id)
         pendingWrites.removeValue(forKey: id)
         mutateTag(id) { t in t.rssi = nil; t.distance = nil; t.soundOn = false }
-        central.connect(peripheral, options: nil)
-    }
-
-    private func registerAndConnect(_ p: CBPeripheral) {
-        let id = p.identifier.uuidString
-        guard peripherals[id] == nil else { return }
-        peripherals[id] = p
-        p.delegate = self
-        let tagIndex = tags.count
-        let name = nameMap[id]
-                ?? fmName(at: tagIndex)
-                ?? (tags.isEmpty ? "AirTag" : "AirTag \(tagIndex + 1)")
-        tags.append(FoundTag(id: id, name: name))
-        central?.connect(p, options: nil)
+        if peripherals[id] != nil {
+            central.connect(peripheral, options: nil)   // auto-reconnect verified devices only
+        }
     }
 
     private func startRSSI(for p: CBPeripheral) {
@@ -253,11 +282,26 @@ extension AirTagService: CBCentralManagerDelegate {
 }
 
 // MARK: - CBPeripheralDelegate
+
 extension AirTagService: CBPeripheralDelegate {
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        let id = peripheral.identifier.uuidString
+        if error == nil,
+           let svcs = peripheral.services,
+           svcs.contains(where: { $0.uuid == kFindMyServiceUUID }) {
+            // Confirmed Find My device
+            addVerifiedPeripheral(peripheral)
+        } else {
+            // Not a Find My device — drop it
+            candidates.remove(id)
+            central?.cancelPeripheralConnection(peripheral)
+        }
+    }
 
     func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
         guard error == nil, RSSI.intValue < 0 else { return }
-        let id = peripheral.identifier.uuidString
+        let id  = peripheral.identifier.uuidString
         let raw = Double(RSSI.intValue)
         let ema = smoothedRSSI[id].map { kEMAAlpha * raw + (1 - kEMAAlpha) * $0 } ?? raw
         smoothedRSSI[id] = ema
@@ -275,15 +319,14 @@ extension AirTagService: CBPeripheralDelegate {
         ch.outputStream.schedule(in: .main, forMode: .common)
         ch.inputStream.open()
         ch.outputStream.open()
-        // If the stream is immediately ready, flush any pending write now;
-        // otherwise StreamDelegate will fire .hasSpaceAvailable and flush it
         if ch.outputStream.hasSpaceAvailable, let bytes = pendingWrites.removeValue(forKey: id) {
             writeToChannel(ch, bytes: bytes)
         }
     }
 }
 
-// MARK: - StreamDelegate (L2CAP output stream ready)
+// MARK: - StreamDelegate
+
 extension AirTagService: StreamDelegate {
     func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
         guard eventCode.contains(.hasSpaceAvailable) else { return }
