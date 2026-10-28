@@ -73,10 +73,9 @@ final class AirTagService: NSObject, ObservableObject {
     // MARK: - Helpers
 
     private func sendCommand(_ bytes: [UInt8], to ch: CBL2CAPChannel) {
-        let data = Data(bytes)
-        data.withUnsafeBytes { ptr in
-            guard let base = ptr.bindMemory(to: UInt8.self).baseAddress else { return }
-            ch.outputStream.write(base, maxLength: data.count)
+        bytes.withUnsafeBufferPointer {
+            guard let base = $0.baseAddress else { return }
+            _ = ch.outputStream.write(base, maxLength: $0.count)
         }
     }
 
