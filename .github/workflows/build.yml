@@ -28,10 +28,18 @@ jobs:
             -configuration Release \
             ONLY_ACTIVE_ARCH=NO \
             ARCHS=arm64 \
-            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_ENTITLEMENTS="AirTagCat/AirTagCat.entitlements" \
+            CODE_SIGNING_ALLOWED=NO \
             SYMROOT="$(pwd)/build"
+
+      - name: Embed entitlements (ad-hoc re-sign)
+        run: |
+          APP="AirTagCat/build/Release-iphoneos/AirTagCat.app"
+          # xcodebuild with iphoneos SDK refuses ad-hoc signing; codesign does not
+          codesign -f -s "-" \
+            --entitlements "AirTagCat/AirTagCat/AirTagCat.entitlements" \
+            "$APP"
 
       - name: Package IPA
         run: |
