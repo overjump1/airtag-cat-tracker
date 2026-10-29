@@ -4,7 +4,8 @@
 // We hook CLDurianService -performTask:forClient:onDevice: using the standard
 // ObjC runtime (method_setImplementation), so no substrate.h is required.
 //
-// Socket protocol: newline-delimited JSON on /tmp/airtagcat.sock
+// Socket protocol: newline-delimited JSON on the first of SOCKET_PATHS that
+// locationd's sandbox lets us create (the app probes the same list)
 //   tweak → app:  {"type":"devices","devices":[{"id":"…","name":"…","peripheralId":"…"}]}
 //   app → tweak:  {"type":"playSound","deviceId":"…","sequence":[4,1,0,0,5,2,0,0]}
 //                 {"type":"stopSound","deviceId":"…"}
@@ -18,7 +19,14 @@
 #import <pthread.h>
 #import <unistd.h>
 
-#define SOCKET_PATH "/tmp/airtagcat.sock"
+// locationd's sandbox denies file-write-create in /tmp. Try the jailbreak root
+// first (the app, running as mobile, can always reach it), then locationd's own
+// cache dir. Keep in sync with kSocketPaths in AirTagService.swift.
+static const char *SOCKET_PATHS[] = {
+    "/var/jb/var/tmp/airtagcat.sock",
+    "/var/root/Library/Caches/locationd/airtagcat.sock",
+    "/tmp/airtagcat.sock",
+};
 
 static id   g_service = nil;
 static id   g_client  = nil;
@@ -175,20 +183,30 @@ static void *clientThread(void *arg) {
 }
 
 static void *serverThread(void *arg) {
-    unlink(SOCKET_PATH);
-    int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sfd < 0) return NULL;
-    g_serverFd = sfd;
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strlcpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path));
-    if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        NSLog(@"[AirTagCat] bind(%s) failed: errno %d (%s)", SOCKET_PATH, errno, strerror(errno));
-        close(sfd); return NULL;
+    int sfd = -1;
+    const char *path = NULL;
+    for (size_t i = 0; i < sizeof(SOCKET_PATHS) / sizeof(*SOCKET_PATHS); i++) {
+        path = SOCKET_PATHS[i];
+        char dir[sizeof(((struct sockaddr_un *)0)->sun_path)];
+        strlcpy(dir, path, sizeof(dir));
+        *strrchr(dir, '/') = '\0';
+        if (mkdir(dir, 0777) == 0) chmod(dir, 0777);
+        unlink(path);
+        sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sfd < 0) return NULL;
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
+        if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) == 0) break;
+        NSLog(@"[AirTagCat] bind(%s) failed: errno %d (%s)", path, errno, strerror(errno));
+        close(sfd); sfd = -1;
     }
-    NSLog(@"[AirTagCat] listening on %s", SOCKET_PATH);
-    chmod(SOCKET_PATH, 0777);
+    if (sfd < 0) { NSLog(@"[AirTagCat] no usable socket path"); return NULL; }
+    g_serverFd = sfd;
+    if (chmod(path, 0777) < 0)
+        NSLog(@"[AirTagCat] chmod(%s) failed: errno %d (%s)", path, errno, strerror(errno));
+    NSLog(@"[AirTagCat] listening on %s", path);
     listen(sfd, 8);
     while (1) {
         int cfd = accept(sfd, NULL, NULL);

@@ -1,7 +1,13 @@
 import CoreBluetooth
 import Darwin
 
-private let kSocketPath = "/tmp/airtagcat.sock"
+// Same order as SOCKET_PATHS in Tweak.m; the tweak binds the first one
+// locationd's sandbox allows.
+private let kSocketPaths = [
+    "/var/jb/var/tmp/airtagcat.sock",
+    "/var/root/Library/Caches/locationd/airtagcat.sock",
+    "/tmp/airtagcat.sock",
+]
 private let kRSSI1m: Double = -59
 private let kPathN:  Double =  2.7
 private let kNamesKey       = "airtag_names_v1"
@@ -60,6 +66,7 @@ final class AirTagService: NSObject, ObservableObject {
     @Published var tags:  [FoundTag] = []
 
     private var socketFd:        Int32          = -1
+    private var loggedErrors:    [String: Int32] = [:]   // per path, so retries don't spam
     private var nameMap:         [String: String]
     private var peripherals:     [String: CBPeripheral] = [:]  // tagID → CBPeripheral
     private var peripheralUUIDs: [String: UUID]         = [:]  // tagID → peripheral UUID
@@ -118,12 +125,25 @@ final class AirTagService: NSObject, ObservableObject {
     }
 
     private func doConnect() {
+        guard let fd = kSocketPaths.lazy.compactMap(connectSocket).first else {
+            scheduleRetry(); return
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            self?.socketFd = fd
+            self?.hintTimer?.invalidate()
+            self?.state = .ready
+        }
+        readLoop(fd: fd)
+    }
+
+    private func connectSocket(_ path: String) -> Int32? {
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { scheduleRetry(); return }
+        guard fd >= 0 else { return nil }
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        _ = kSocketPath.withCString { src in
+        _ = path.withCString { src in
             withUnsafeMutablePointer(to: &addr.sun_path.0) { Darwin.strcpy($0, src) }
         }
         let ok = withUnsafePointer(to: addr) {
@@ -132,14 +152,17 @@ final class AirTagService: NSObject, ObservableObject {
             }
         } == 0
 
-        guard ok else { Darwin.close(fd); scheduleRetry(); return }
-
-        DispatchQueue.main.async { [weak self] in
-            self?.socketFd = fd
-            self?.hintTimer?.invalidate()
-            self?.state = .ready
+        guard ok else {
+            let err = errno
+            Darwin.close(fd)
+            if loggedErrors[path] != err {
+                loggedErrors[path] = err
+                NSLog("[AirTagCat] connect(%@) failed: errno %d (%@)", path, err, String(cString: strerror(err)))
+            }
+            return nil
         }
-        readLoop(fd: fd)
+        NSLog("[AirTagCat] connected to %@", path)
+        return fd
     }
 
     private func readLoop(fd: Int32) {
