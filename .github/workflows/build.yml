@@ -10,15 +10,9 @@ permissions:
 
 jobs:
   build:
-    # Any macOS runner works — no Theos, no special toolchain needed.
-    # macos-13, macos-14, macos-15 are all fine; use the matrix so whichever
-    # GitHub has capacity for picks up the job first.
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        runner: [macos-13, macos-14, macos-15]
-      fail-fast: false   # let all runners try; first to finish publishes the release
-    continue-on-error: false
+    # Self-hosted Mac (Xcode + gh + dpkg installed on the host). Hosted macOS
+    # runners queued for too long; any macOS machine with Xcode still works.
+    runs-on: [self-hosted, macOS, ARM64]
 
     steps:
       - uses: actions/checkout@v4
