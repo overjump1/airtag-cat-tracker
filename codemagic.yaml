@@ -1,0 +1,68 @@
+workflows:
+  build-deb:
+    name: Build AirTagCat .deb
+    max_build_duration: 20
+    environment:
+      xcode: latest
+    scripts:
+      - name: Build Swift app (unsigned arm64)
+        working_directory: AirTagCat
+        script: |
+          xcodebuild \
+            -project AirTagCat.xcodeproj \
+            -target AirTagCat \
+            -sdk iphoneos \
+            -configuration Release \
+            ONLY_ACTIVE_ARCH=NO \
+            ARCHS=arm64 \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            SYMROOT="$(pwd)/build"
+
+      - name: Re-sign app with no-sandbox entitlement
+        script: |
+          codesign -f -s "-" \
+            --entitlements AirTagCat/AirTagCat/AirTagCat.entitlements \
+            AirTagCat/build/Release-iphoneos/AirTagCat.app
+
+      - name: Build tweak dylib
+        script: |
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -dynamiclib \
+            -fno-objc-arc \
+            -fobjc-exceptions \
+            -framework Foundation \
+            -o Tweak/AirTagCatTweak.dylib \
+            Tweak/Tweak.m
+          codesign -f -s "-" Tweak/AirTagCatTweak.dylib
+
+      - name: Package .deb
+        script: |
+          R=$(mktemp -d)
+          mkdir -p "$R/DEBIAN"
+          mkdir -p "$R/var/jb/Library/MobileSubstrate/DynamicLibraries"
+          mkdir -p "$R/var/jb/Applications"
+
+          cp Tweak/AirTagCatTweak.dylib  "$R/var/jb/Library/MobileSubstrate/DynamicLibraries/"
+          cp Tweak/AirTagCatTweak.plist  "$R/var/jb/Library/MobileSubstrate/DynamicLibraries/"
+          cp -R AirTagCat/build/Release-iphoneos/AirTagCat.app "$R/var/jb/Applications/"
+
+          cat > "$R/DEBIAN/control" <<'CTRL'
+          Package: com.local.airtagcat
+          Name: AirTagCat
+          Version: 1.0
+          Architecture: iphoneos-arm64
+          Description: Track your cat's AirTag - hooks locationd for real proximity
+          Maintainer: AirTagCat <noreply@local>
+          Section: Tweaks
+          Depends: mobilesubstrate | libhooker | substitute
+          CTRL
+
+          install -m 755 Tweak/postinst "$R/DEBIAN/postinst"
+          brew install dpkg
+          dpkg-deb --build "$R" AirTagCat.deb
+
+    artifacts:
+      - AirTagCat.deb
