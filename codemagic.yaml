@@ -30,6 +30,8 @@ workflows:
         script: |
           xcrun -sdk iphoneos clang \
             -arch arm64 \
+            -arch arm64e \
+            -miphoneos-version-min=15.0 \
             -dynamiclib \
             -fno-objc-arc \
             -fobjc-exceptions \

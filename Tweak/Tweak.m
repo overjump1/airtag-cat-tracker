@@ -34,6 +34,14 @@ static void handleCommand(NSDictionary *cmd);
 static void *serverThread(void *arg);
 static void *clientThread(void *arg);
 
+// valueForKey: throws NSUndefinedKeyException for unknown keys, which would
+// crash locationd — the key names we probe are guesses, so swallow misses.
+static id safeValue(id obj, NSString *key) {
+    if (!obj) return nil;
+    @try { return [obj valueForKey:key]; }
+    @catch (NSException *e) { return nil; }
+}
+
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
 static void hook_performTask(id self, SEL _cmd, id task, id client, id device) {
@@ -47,7 +55,7 @@ static void hook_performTask(id self, SEL _cmd, id task, id client, id device) {
 
     NSString *key = nil;
     for (NSString *s in @[@"identifier", @"serialNumber", @"deviceIdentifier"]) {
-        id v = [device valueForKey:s];
+        id v = safeValue(device, s);
         if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) { key = v; break; }
         if ([v isKindOfClass:[NSUUID class]])  { key = [(NSUUID *)v UUIDString]; break; }
     }
@@ -57,15 +65,15 @@ static void hook_performTask(id self, SEL _cmd, id task, id client, id device) {
     g_devices[key] = [device retain];
 
     NSString *peripheralId = @"";
-    id peri = [device valueForKey:@"peripheral"] ?: [device valueForKey:@"cbPeripheral"];
+    id peri = safeValue(device, @"peripheral") ?: safeValue(device, @"cbPeripheral");
     if (peri) {
-        id uuid = [device valueForKey:@"identifier"] ?: [peri valueForKey:@"identifier"];
+        id uuid = safeValue(device, @"identifier") ?: safeValue(peri, @"identifier");
         if ([uuid isKindOfClass:[NSUUID class]]) peripheralId = [(NSUUID *)uuid UUIDString];
     }
 
     NSString *name = nil;
     for (NSString *s in @[@"name", @"displayName", @"localizedName"]) {
-        id v = [device valueForKey:s];
+        id v = safeValue(device, s);
         if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) { name = v; break; }
     }
 
@@ -175,7 +183,11 @@ static void *serverThread(void *arg) {
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strlcpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path));
-    if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(sfd); return NULL; }
+    if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        NSLog(@"[AirTagCat] bind(%s) failed: errno %d (%s)", SOCKET_PATH, errno, strerror(errno));
+        close(sfd); return NULL;
+    }
+    NSLog(@"[AirTagCat] listening on %s", SOCKET_PATH);
     chmod(SOCKET_PATH, 0777);
     listen(sfd, 8);
     while (1) {
@@ -194,6 +206,7 @@ static void *serverThread(void *arg) {
 __attribute__((constructor))
 static void init_hook(void) {
     if (![NSProcessInfo.processInfo.processName isEqualToString:@"locationd"]) return;
+    NSLog(@"[AirTagCat] loaded into locationd (pid %d)", getpid());
 
     Class cls = NSClassFromString(@"CLDurianService");
     if (cls) {
@@ -202,7 +215,12 @@ static void init_hook(void) {
         if (m) {
             orig_performTask = (void(*)(id,SEL,id,id,id))method_getImplementation(m);
             method_setImplementation(m, (IMP)hook_performTask);
+            NSLog(@"[AirTagCat] hooked CLDurianService -performTask:forClient:onDevice:");
+        } else {
+            NSLog(@"[AirTagCat] CLDurianService has no -performTask:forClient:onDevice:");
         }
+    } else {
+        NSLog(@"[AirTagCat] CLDurianService class not found");
     }
 
     g_clients = [[NSMutableArray alloc] init];
